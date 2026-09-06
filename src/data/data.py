@@ -12,7 +12,15 @@ from monai.transforms import RandAffined
 from monai.utils import set_determinism
 from torch.utils.data import Dataset, ConcatDataset
 from tqdm import tqdm
-from connectomics.data.utils.data_transform import skeleton_aware_distance_transform
+try:
+    # Older pytorch-connectomics API.
+    from connectomics.data.utils.data_transform import skeleton_aware_distance_transform
+except ModuleNotFoundError:
+    try:
+        # Newer pytorch-connectomics API.
+        from connectomics.data.processing.distance import skeleton_aware_distance_transform
+    except ModuleNotFoundError:
+        skeleton_aware_distance_transform = None
 
 import warnings
 
@@ -89,6 +97,10 @@ class AffinityDataset(Dataset):
             affine=0.0).
         divide: The divisor for the image. Typically, 255 if img in [0, 255]
             (as is the case for uint8). Defaults to 1.
+        ensure_foreground: Whether to require sampled patches to contain at least
+            one foreground voxel (seg > 0). Defaults to True.
+        max_sampling_attempts: Maximum number of resampling attempts when
+            ensure_foreground is enabled. Defaults to 100.
     """
 
     def __init__(
@@ -117,6 +129,8 @@ class AffinityDataset(Dataset):
                 sdt=False,
                 resolution=(1.0, 1.0, 1.0),
             ),
+            ensure_foreground: bool = True,
+            max_sampling_attempts: int = 100,
     ):
         set_determinism(seed=np.random.randint(0, 2**32))
         self.size_divisor = size_divisor
@@ -128,6 +142,8 @@ class AffinityDataset(Dataset):
         self.len_multiplier = len_multiplier
         self.augment_args = augment_args
         self.sdt_args = sdt_args
+        self.ensure_foreground = ensure_foreground
+        self.max_sampling_attempts = max_sampling_attempts
 
         self.offset = tuple((img.shape[i] - seg.shape[i]) // 2 for i in range(3))
 
@@ -156,13 +172,10 @@ class AffinityDataset(Dataset):
             )
 
     def __getitem__(self, item):
-        pos = [_sample_position(o, self.size, self.size_divisor, s) for o, s in zip(self.offset, self.seg.shape)]
-        slices = tuple(slice(p, p + self.size + self.long_range) for p in pos)
+        slices, seg = self._sample_valid_patch()
         # Easiest for affine augmentation: all dimensions same
-
         img = np.moveaxis(self.img[slices] / self.divide, -1, 0)
         assert len(img.shape) == 4
-        seg = self.seg[slices].copy()
 
         seg_cc = cc3d.connected_components(
             seg,
@@ -179,10 +192,22 @@ class AffinityDataset(Dataset):
         labeled_mask = seg != -1
         aff, loss_mask = comp_affinities(seg, labeled_mask=labeled_mask, long_range=self.long_range)
         if self.sdt_args.sdt:
-            sdt, _ = skeleton_aware_distance_transform(
+            if skeleton_aware_distance_transform is None:
+                raise ModuleNotFoundError(
+                    "skeleton_aware_distance_transform is unavailable. "
+                    "Install a compatible pytorch-connectomics version."
+                )
+            sdt_result = skeleton_aware_distance_transform(
                 (seg + (seg == -1)), # treat unlabeled as background
                 resolution=self.sdt_args.resolution,
             )
+            # Support both return styles:
+            # - old API: (sdt, skeleton) tuple
+            # - new API: sdt ndarray
+            if isinstance(sdt_result, tuple):
+                sdt = sdt_result[0]
+            else:
+                sdt = sdt_result
             assert sdt.shape == seg.shape
 
         aff = aff[:, : self.size, : self.size, : self.size]
@@ -213,6 +238,23 @@ class AffinityDataset(Dataset):
             data[k] = v.copy()
 
         return data
+
+    def _sample_valid_patch(self):
+        """Sample a patch and optionally enforce foreground presence."""
+        attempts = self.max_sampling_attempts if self.ensure_foreground else 1
+        for _ in range(attempts):
+            pos = [_sample_position(o, self.size, self.size_divisor, s) for o, s in zip(self.offset, self.seg.shape)]
+            slices = tuple(slice(p, p + self.size + self.long_range) for p in pos)
+            seg = self.seg[slices]
+            if not self.ensure_foreground or np.any(seg[: self.size, : self.size, : self.size] > 0):
+                return slices, seg.copy()
+
+        raise RuntimeError(
+            "Could not sample a foreground-containing patch after "
+            f"{self.max_sampling_attempts} attempts. "
+            "Check whether this volume contains foreground labels (seg > 0) "
+            "or increase max_sampling_attempts."
+        )
 
     def _apply_augmentations(self, img, seg):
         axes_shuffled = np.random.permutation(3)  # x,y,z treated same
@@ -374,6 +416,8 @@ def get_seg_dataset(
             long_range=augment_args.long_range,
             small_size=small_size,
             sdt_args=sdt_args,
+            ensure_foreground=getattr(augment_args, "ensure_foreground", True),
+            max_sampling_attempts=getattr(augment_args, "max_sampling_attempts", 100),
         )
         assert len(dataset) > 0
         datasets.append(dataset)
@@ -426,10 +470,10 @@ def load_data(args: argparse.Namespace):
         # Concatenate all training datasets
         train_data = ConcatDataset(train_datasets)
         
-        # For validation, use the first dataset or concatenate all
-        # Using first dataset for simplicity and faster validation
-        val_data = val_datasets[0]
-        print(f"Using validation data from: {data_settings[0]}")
+        val_data = ConcatDataset(val_datasets)
+        # Keep the channel-count lookup used below.
+        val_data.img = val_datasets[0].img
+        print(f"Using validation data from all datasets: {data_settings}")
     
     n_channels = val_data.img.shape[-1]
     return train_data, val_data, n_channels
@@ -506,6 +550,8 @@ def get_syn_train_data(args: argparse.Namespace):
             divide=255.0,
             small_size=args.small_size,
             sdt_args=args,
+            ensure_foreground=getattr(args, "ensure_foreground", True),
+            max_sampling_attempts=getattr(args, "max_sampling_attempts", 100),
         )
         for img_seg in img_segs_train
     ]
@@ -546,4 +592,6 @@ def get_val_data(args: argparse.Namespace):
         divide=255.0,
         small_size=args.small_size,
         sdt_args=args,
+        ensure_foreground=getattr(args, "ensure_foreground", True),
+        max_sampling_attempts=getattr(args, "max_sampling_attempts", 100),
     )

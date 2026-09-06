@@ -1,4 +1,5 @@
 import gc
+from pathlib import Path
 from typing import Union, List, Tuple
 
 import numba
@@ -13,6 +14,53 @@ from torch import autocast
 from torch.nn.functional import sigmoid
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
+
+
+def _pad_image_for_inference(
+        img: np.ndarray,
+        small_size: int,
+        padding_mode: str,
+        padding_position: str,
+        padding_constant: float = 0,
+) -> Tuple[np.ndarray, Tuple[slice, slice, slice], bool]:
+    """Pad spatial dimensions smaller than the patch size and return crop slices."""
+    original_shape = img.shape[:3]
+    needs_padding = any(dim < small_size for dim in original_shape)
+    crop_slices = tuple(slice(0, dim) for dim in original_shape)
+    if not needs_padding:
+        return img, crop_slices, False
+
+    if padding_position not in {"end", "center"}:
+        raise ValueError(f"Unsupported padding_position={padding_position!r}; expected 'end' or 'center'.")
+
+    print(
+        f"Image dimensions {original_shape} smaller than patch size {small_size}, "
+        f"padding to minimum size with mode={padding_mode}, position={padding_position}"
+    )
+    pad_width = []
+    crop = []
+    for dim in original_shape:
+        if dim < small_size:
+            total = small_size - dim
+            if padding_position == "center":
+                before = total // 2
+                after = total - before
+            else:
+                before = 0
+                after = total
+            pad_width.append((before, after))
+            crop.append(slice(before, before + dim))
+        else:
+            pad_width.append((0, 0))
+            crop.append(slice(0, dim))
+    pad_width.append((0, 0))
+
+    if padding_mode == "constant":
+        img = np.pad(img, pad_width, mode=padding_mode, constant_values=padding_constant)
+    else:
+        img = np.pad(img, pad_width, mode=padding_mode)
+    print(f"Padded image shape: {img.shape}")
+    return img, tuple(crop), True
 
 
 def scale_sigmoid(x: torch.Tensor) -> torch.Tensor:
@@ -76,6 +124,9 @@ def patched_inference(
         do_overlap: bool = True,
         prediction_channels: int = 6,
         divide: int = 1,
+        padding_mode: str = "constant",
+        padding_position: str = "end",
+        padding_constant: float = 0,
 ) -> np.ndarray:
     """
     Perform patched inference with a model on an image.
@@ -102,26 +153,13 @@ def patched_inference(
         f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
     img = img[:]  # load into memory (expensive!)
     
-    # Store original shape for later cropping
-    original_shape = img.shape[:3]
-    
-    # Check if any dimension is smaller than small_size and pad if necessary
-    needs_padding = any(dim < small_size for dim in original_shape)
-    if needs_padding:
-        print(f"Image dimensions {original_shape} smaller than patch size {small_size}, padding to minimum size")
-        # Calculate padding needed for each dimension
-        pad_width = []
-        for dim in original_shape:
-            if dim < small_size:
-                pad_width.append((0, small_size - dim))
-            else:
-                pad_width.append((0, 0))
-        # Add padding for channel dimension (no padding)
-        pad_width.append((0, 0))
-        
-        # Pad the image
-        img = np.pad(img, pad_width, mode='constant', constant_values=0)
-        print(f"Padded image shape: {img.shape}")
+    img, crop_slices, needs_padding = _pad_image_for_inference(
+        img,
+        small_size=small_size,
+        padding_mode=padding_mode,
+        padding_position=padding_position,
+        padding_constant=padding_constant,
+    )
 
     patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
     single_pred_weight = get_single_pred_weight(do_overlap, small_size)
@@ -156,7 +194,7 @@ def patched_inference(
 
     # Crop back to original size if padding was applied
     if needs_padding:
-        weighted_pred = weighted_pred[:, :original_shape[0], :original_shape[1], :original_shape[2]]
+        weighted_pred = weighted_pred[:, crop_slices[0], crop_slices[1], crop_slices[2]]
         print(f"Cropped prediction back to original shape: {weighted_pred.shape[1:]}")
 
     return weighted_pred
@@ -198,6 +236,9 @@ def patched_inference_batch(
         batch_size: int = 4,
         num_workers: int = 4,
         pin_memory: bool = True,
+        padding_mode: str = "constant",
+        padding_position: str = "end",
+        padding_constant: float = 0,
 ) -> np.ndarray:
     """
     Perform patched inference with a model on an image using parallel batch processing.
@@ -229,26 +270,13 @@ def patched_inference_batch(
         f"batch_size={batch_size}, num_workers={num_workers} for img of shape {img.shape} and dtype {img.dtype}")
     img = img[:]  # load into memory (expensive!)
     
-    # Store original shape for later cropping
-    original_shape = img.shape[:3]
-    
-    # Check if any dimension is smaller than small_size and pad if necessary
-    needs_padding = any(dim < small_size for dim in original_shape)
-    if needs_padding:
-        print(f"Image dimensions {original_shape} smaller than patch size {small_size}, padding to minimum size")
-        # Calculate padding needed for each dimension
-        pad_width = []
-        for dim in original_shape:
-            if dim < small_size:
-                pad_width.append((0, small_size - dim))
-            else:
-                pad_width.append((0, 0))
-        # Add padding for channel dimension (no padding)
-        pad_width.append((0, 0))
-        
-        # Pad the image
-        img = np.pad(img, pad_width, mode='constant', constant_values=0)
-        print(f"Padded image shape: {img.shape}")
+    img, crop_slices, needs_padding = _pad_image_for_inference(
+        img,
+        small_size=small_size,
+        padding_mode=padding_mode,
+        padding_position=padding_position,
+        padding_constant=padding_constant,
+    )
 
     patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
     single_pred_weight = get_single_pred_weight(do_overlap, small_size)
@@ -313,10 +341,188 @@ def patched_inference_batch(
 
     # Crop back to original size if padding was applied
     if needs_padding:
-        weighted_pred = weighted_pred[:, :original_shape[0], :original_shape[1], :original_shape[2]]
+        weighted_pred = weighted_pred[:, crop_slices[0], crop_slices[1], crop_slices[2]]
         print(f"Cropped prediction back to original shape: {weighted_pred.shape[1:]}")
 
     return weighted_pred
+
+
+@torch.no_grad()
+def patched_inference_batch_to_zarr(
+        img: np.ndarray,
+        model: torch.nn.Module,
+        output_dir: Union[str, Path],
+        output_channel_indices: Tuple[int, ...] = (0, 1, 2, 3, 4, 5),
+        small_size: int = 128,
+        do_overlap: bool = True,
+        prediction_channels: int = 7,
+        divide: int = 1,
+        batch_size: int = 2,
+        output_block_shape: Tuple[int, int, int] = (256, 512, 512),
+        output_chunks: Tuple[int, int, int] = (64, 256, 256),
+        padding_mode: str = "constant",
+        padding_position: str = "end",
+        padding_constant: float = 0,
+) -> List[Path]:
+    """Run exact overlap-add inference one output block at a time.
+
+    Unlike :func:`patched_inference_batch`, this function never allocates a
+    channel-by-full-volume accumulator. Each disjoint output block gathers all
+    model patches that overlap it, normalizes the block, and immediately writes
+    float16 channel arrays to Zarr. Patches crossing output-block boundaries are
+    recomputed, trading modest extra GPU work for bounded host memory and no
+    temporary full-volume numerator arrays.
+    """
+    if not isinstance(img, np.ndarray) or img.ndim != 4:
+        raise ValueError(f"Expected a channel-last 4-D NumPy image, got {type(img)} {getattr(img, 'shape', None)}")
+    if not 3 <= prediction_channels <= 7:
+        raise ValueError(f"prediction_channels must be between 3 and 7, got {prediction_channels}")
+    if not output_channel_indices or len(set(output_channel_indices)) != len(output_channel_indices):
+        raise ValueError("output_channel_indices must be non-empty and unique")
+    if any(channel < 0 or channel >= prediction_channels for channel in output_channel_indices):
+        raise ValueError(
+            f"Output channels {output_channel_indices} are incompatible with {prediction_channels} predictions"
+        )
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if len(output_block_shape) != 3 or any(int(value) <= 0 for value in output_block_shape):
+        raise ValueError(f"Invalid output_block_shape: {output_block_shape}")
+    if len(output_chunks) != 3 or any(int(value) <= 0 for value in output_chunks):
+        raise ValueError(f"Invalid output_chunks: {output_chunks}")
+
+    calculate_sdt = prediction_channels == 7
+    if calculate_sdt and not bool(model.hparams.sdt):
+        raise ValueError("Seven-channel inference requires a checkpoint trained with SDT")
+    original_shape = tuple(int(value) for value in img.shape[:3])
+    img, crop_slices, _ = _pad_image_for_inference(
+        img,
+        small_size=small_size,
+        padding_mode=padding_mode,
+        padding_position=padding_position,
+        padding_constant=padding_constant,
+    )
+    padded_shape = tuple(int(value) for value in img.shape[:3])
+    crop_offsets = tuple(int(item.start) for item in crop_slices)
+    # Preserve the legacy dense implementation's coordinate order so each
+    # voxel receives floating-point additions in the same sequence.
+    patch_coordinates = get_coordinates(padded_shape, small_size, do_overlap)
+    single_pred_weight = get_single_pred_weight(do_overlap, small_size)
+    if single_pred_weight is None:
+        single_pred_weight = np.ones((small_size,) * 3, dtype=np.float32)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chunks = tuple(min(int(chunk), dim) for chunk, dim in zip(output_chunks, original_shape))
+    output_paths = [output_dir / f"channel_{channel}.zarr" for channel in output_channel_indices]
+    output_arrays = [
+        zarr.open_array(
+            str(path),
+            mode="w",
+            shape=original_shape,
+            chunks=chunks,
+            dtype=np.float16,
+        )
+        for path in output_paths
+    ]
+
+    device = next(model.parameters()).device
+    tensor_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    block_starts = [range(0, dim, int(block)) for dim, block in zip(original_shape, output_block_shape)]
+    blocks = [
+        (
+            slice(z, min(z + int(output_block_shape[0]), original_shape[0])),
+            slice(y, min(y + int(output_block_shape[1]), original_shape[1])),
+            slice(x, min(x + int(output_block_shape[2]), original_shape[2])),
+        )
+        for z in block_starts[0]
+        for y in block_starts[1]
+        for x in block_starts[2]
+    ]
+    print(
+        f"Streaming overlap-add: image={original_shape}, padded={padded_shape}, "
+        f"patches={len(patch_coordinates)}, output_blocks={len(blocks)}, "
+        f"block_shape={tuple(output_block_shape)}, channels={output_channel_indices}",
+        flush=True,
+    )
+
+    amp_context = (
+        lambda: torch.autocast(device_type="cuda", dtype=torch.float16)
+        if device.type == "cuda"
+        else torch.autocast(device_type="cpu", enabled=False)
+    )
+    for block in tqdm(blocks, desc="Streaming output blocks"):
+        core_start = tuple(int(item.start) + offset for item, offset in zip(block, crop_offsets))
+        core_stop = tuple(int(item.stop) + offset for item, offset in zip(block, crop_offsets))
+        core_shape = tuple(stop - start for start, stop in zip(core_start, core_stop))
+        weighted = np.zeros((len(output_channel_indices), *core_shape), dtype=np.float32)
+        weight_sum = np.zeros(core_shape, dtype=np.float32)
+        # Preserve the dense predictor's GLOBAL batch membership, including the
+        # final short batch. Rebatching only the patches touching this block can
+        # change CUDA convolution rounding and hence threshold decisions.
+        relevant_batches = []
+        for batch_start in range(0, len(patch_coordinates), batch_size):
+            coordinates = patch_coordinates[batch_start:batch_start + batch_size]
+            if any(all(patch_start < stop and patch_start + small_size > start
+                       for patch_start, start, stop in zip(coordinate, core_start, core_stop))
+                   for coordinate in coordinates):
+                relevant_batches.append(coordinates)
+        if not relevant_batches:
+            raise RuntimeError(f"No inference patches overlap output block {block}")
+
+        for coordinates in relevant_batches:
+            patch_array = np.stack([
+                np.moveaxis(
+                    img[
+                        z:z + small_size,
+                        y:y + small_size,
+                        x:x + small_size,
+                    ],
+                    -1,
+                    0,
+                )
+                for z, y, x in coordinates
+            ])
+            # Match PatchDataset: normalize in CPU tensor_dtype before transfer.
+            batch_tensor = (torch.from_numpy(patch_array).to(dtype=tensor_dtype) / divide).to(
+                device=device, non_blocking=False)
+            with amp_context():
+                raw = model(batch_tensor)
+                if calculate_sdt:
+                    prediction = torch.cat(
+                        [scale_sigmoid(raw[:, :prediction_channels - 1]),
+                         tanh(raw[:, prediction_channels - 1:prediction_channels])],
+                        dim=1,
+                    )
+                else:
+                    prediction = scale_sigmoid(raw)[:, :prediction_channels]
+            prediction = prediction[:, output_channel_indices].float().cpu().numpy()
+
+            for item, coordinate in enumerate(coordinates):
+                patch_stop = tuple(value + small_size for value in coordinate)
+                overlap_start = tuple(max(left, right) for left, right in zip(coordinate, core_start))
+                overlap_stop = tuple(min(left, right) for left, right in zip(patch_stop, core_stop))
+                if any(stop <= start for start, stop in zip(overlap_start, overlap_stop)):
+                    continue  # Batch partner outside this output block.
+                source = tuple(
+                    slice(start - patch_start, stop - patch_start)
+                    for start, stop, patch_start in zip(overlap_start, overlap_stop, coordinate)
+                )
+                destination = tuple(
+                    slice(start - core_axis_start, stop - core_axis_start)
+                    for start, stop, core_axis_start in zip(overlap_start, overlap_stop, core_start)
+                )
+                local_weight = single_pred_weight[source]
+                weighted[(slice(None), *destination)] += prediction[(item, slice(None), *source)] * local_weight
+                weight_sum[destination] += local_weight
+
+        if not np.all(weight_sum > 0):
+            missing = int(np.count_nonzero(weight_sum <= 0))
+            raise RuntimeError(f"Output block {block} has {missing} voxels without prediction weight")
+        weighted /= weight_sum[None]
+        for channel_array, values in zip(output_arrays, weighted):
+            channel_array[block] = values.astype(np.float16)
+
+    return output_paths
 
 
 def get_coordinates(

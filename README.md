@@ -33,7 +33,13 @@ Run a single training session (BANIS-S(mall)):
 ```bash
 python BANIS.py --seed 0 --batch_size 2 --n_steps 1000000 --data_setting betaSeg han24 Jurkat Cardiac Kidney Liver Sperm Macrophage --base_data_path /path/to/sample_data --save_path ./checkpoints/mito --devices=1 --sdt 
 ```
-Results are logged to TensorBoard. For GPUs with less than 48 GB memory, reduce `batch_size` (and adjust `n_steps` / `learning_rate`). For BANIS-L(arge) add `--model_id L --kernel_size 5`. Additional options are in `parse_args` of `BANIS.py`.
+Results are logged to TensorBoard by default. To also log scalars, images, hyperparameters, and optional checkpoint artifacts to Weights & Biases, pass `--wandb`:
+
+```bash
+python BANIS.py --seed 0 --batch_size 2 --n_steps 1000000 --data_setting betaSeg --base_data_path /path/to/sample_data --save_path ./checkpoints/mito --devices=1 --sdt --wandb --wandb_project banis
+```
+
+Useful W&B options include `--wandb_mode offline`, `--wandb_entity <team>`, `--wandb_group <group>`, `--wandb_tags tag1 tag2`, `--wandb_run_id <id> --wandb_resume allow`, and `--wandb_log_model` for checkpoint artifacts. For GPUs with less than 48 GB memory, reduce `batch_size` (and adjust `n_steps` / `learning_rate`). For BANIS-L(arge) add `--model_id L --kernel_size 5`. Additional options are in `parse_args` of `BANIS.py`.
 
 To run multiple jobs on Slurm, adjust `config.yaml` and `aff_train.sh`, then:
 

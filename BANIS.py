@@ -16,7 +16,7 @@ import zarr
 from nnunet_mednext import create_mednext_v1
 from pytorch_lightning import LightningModule, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, DeviceStatsMonitor, LearningRateMonitor
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from torch.nn.functional import binary_cross_entropy_with_logits, mse_loss, tanh
 from pytorch_lightning.strategies import DDPStrategy
 from torch.optim import AdamW
@@ -94,11 +94,11 @@ class BANIS(LightningModule):
         self.best_nerl_so_far = checkpoint.get("best_nerl_so_far", defaultdict(float))
 
     def on_fit_start(self):
-        self.logger.experiment.add_text("hparams", str(self.hparams))
+        self._add_text("hparams", str(self.hparams))
 
     def _wandb_log_metric(self, name: str, value: torch.Tensor | float) -> None:
         """Best-effort direct W&B logging for critical metrics."""
-        if wandb is None or wandb.run is None:
+        if wandb is None or wandb.run is None or self._has_wandb_logger():
             return
         # Avoid duplicate logs from non-primary ranks.
         if hasattr(self, "trainer") and self.trainer is not None:
@@ -107,6 +107,23 @@ class BANIS(LightningModule):
         if isinstance(value, torch.Tensor):
             value = float(value.detach().cpu().item())
         wandb.log({name: value}, step=int(self.global_step))
+
+    def _iter_logger_experiments(self):
+        if not hasattr(self, "trainer") or self.trainer is None:
+            loggers = [self.logger] if self.logger is not None else []
+        else:
+            loggers = getattr(self.trainer, "loggers", None) or ([self.logger] if self.logger is not None else [])
+        for logger in loggers:
+            experiment = getattr(logger, "experiment", None)
+            if experiment is not None:
+                yield logger, experiment
+
+    def _has_wandb_logger(self) -> bool:
+        if not hasattr(self, "trainer") or self.trainer is None:
+            loggers = [self.logger] if self.logger is not None else []
+        else:
+            loggers = getattr(self.trainer, "loggers", None) or ([self.logger] if self.logger is not None else [])
+        return any(isinstance(logger, WandbLogger) for logger in loggers)
 
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.hparams.learning_rate, weight_decay=self.hparams.weight_decay)
@@ -224,8 +241,27 @@ class BANIS(LightningModule):
         self._add_image(f"{mode}_seg", colored_seg)
 
     def _add_image(self, tag: str, img: torch.Tensor) -> None:
-        self.logger.experiment.add_image(tag, torchvision.utils.make_grid(img, value_range=(0, 1)),
-                                         global_step=self.global_step)
+        grid = torchvision.utils.make_grid(img, value_range=(0, 1))
+        for _, experiment in self._iter_logger_experiments():
+            if hasattr(experiment, "add_image"):
+                experiment.add_image(tag, grid, global_step=self.global_step)
+            elif wandb is not None and hasattr(experiment, "log"):
+                wandb_grid = grid.detach().float().cpu()
+                wandb_grid = torch.nan_to_num(wandb_grid, nan=0.0, posinf=1.0, neginf=0.0)
+                min_value = float(wandb_grid.min())
+                max_value = float(wandb_grid.max())
+                if min_value < 0.0 or max_value > 1.0:
+                    denom = max(max_value - min_value, 1e-8)
+                    wandb_grid = (wandb_grid - min_value) / denom
+                wandb_grid = wandb_grid.clamp(0.0, 1.0)
+                experiment.log({tag: wandb.Image(wandb_grid)}, step=int(self.global_step))
+
+    def _add_text(self, tag: str, text: str) -> None:
+        for _, experiment in self._iter_logger_experiments():
+            if hasattr(experiment, "add_text"):
+                experiment.add_text(tag, text)
+            elif hasattr(experiment, "log"):
+                experiment.log({tag: text}, step=int(self.global_step))
 
     def on_validation_epoch_end(self):
         if self.hparams.validate_extern:
@@ -379,8 +415,13 @@ class BANIS(LightningModule):
                 self.safe_add_scalar(f"{mode}_best_nerl_{k}", v, global_step)
 
     def safe_add_scalar(self, name: str, value: float, global_step=None) -> None:
+        step = self.global_step if global_step is None else global_step
         try:  # s.t. full_cube_inference can be called outside of .fit() without error
-            self.logger.experiment.add_scalar(name, value, self.global_step if global_step is None else global_step)
+            for _, experiment in self._iter_logger_experiments():
+                if hasattr(experiment, "add_scalar"):
+                    experiment.add_scalar(name, value, step)
+                elif hasattr(experiment, "log"):
+                    experiment.log({name: value}, step=int(step))
         except Exception as e:
             print(f"Error logging {name}: {e}")
 
@@ -512,41 +553,41 @@ def main():
     )
     tb_logger.experiment.add_text("save dir", save_dir)
 
-    # Keep TensorBoard as the native logger and optionally sync it to W&B.
-    # This avoids changing existing image/scalar logging code paths.
-    wandb_run = None
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    slurm_proc_id = int(os.environ.get("SLURM_PROCID", "0"))
-    is_global_zero_like = (not args.distributed) or (local_rank == 0 and slurm_proc_id == 0)
-    if args.wandb and args.wandb_mode != "disabled" and is_global_zero_like:
+    loggers = [tb_logger]
+    wandb_logger = None
+    if args.wandb and args.wandb_mode != "disabled":
         if wandb is None:
             raise ModuleNotFoundError(
                 "wandb is not installed, but --wandb is enabled. "
                 "Install wandb or pass --no-wandb."
             )
-        wandb_init_kwargs = {
+        wandb_logger_kwargs = {
             "project": args.wandb_project,
             "name": args.wandb_run_name if args.wandb_run_name else exp_name,
-            "config": vars(args),
-            "dir": save_dir,
-            "mode": args.wandb_mode,
-            "sync_tensorboard": args.wandb_sync_tensorboard,
-            "reinit": True,
+            "save_dir": save_dir,
+            "offline": args.wandb_mode == "offline",
+            "log_model": args.wandb_log_model,
         }
         if args.wandb_entity:
-            wandb_init_kwargs["entity"] = args.wandb_entity
+            wandb_logger_kwargs["entity"] = args.wandb_entity
         if args.wandb_group:
-            wandb_init_kwargs["group"] = args.wandb_group
+            wandb_logger_kwargs["group"] = args.wandb_group
         if args.wandb_tags:
-            wandb_init_kwargs["tags"] = args.wandb_tags
-        wandb_run = wandb.init(**wandb_init_kwargs)
-        if wandb_run is not None:
-            wandb_run.config.update({"save_dir": save_dir}, allow_val_change=True)
+            wandb_logger_kwargs["tags"] = args.wandb_tags
+        if args.wandb_run_id:
+            wandb_logger_kwargs["id"] = args.wandb_run_id
+        if args.wandb_resume:
+            wandb_logger_kwargs["resume"] = args.wandb_resume
+        if args.wandb_sync_tensorboard:
+            wandb_logger_kwargs["sync_tensorboard"] = True
+
+        wandb_logger = WandbLogger(**wandb_logger_kwargs)
+        wandb_logger.log_hyperparams({**vars(args), "save_dir": save_dir})
+        loggers.append(wandb_logger)
         print(
-            f"W&B enabled (mode={args.wandb_mode}, sync_tensorboard={args.wandb_sync_tensorboard})"
+            f"W&B enabled (project={args.wandb_project}, mode={args.wandb_mode}, "
+            f"sync_tensorboard={args.wandb_sync_tensorboard})"
         )
-    elif args.wandb and not is_global_zero_like:
-        print("Skipping W&B init on non-primary distributed process.")
     else:
         print("W&B disabled.")
 
@@ -566,7 +607,7 @@ def main():
                 logging_interval='step'
             ),
         ],
-        logger=tb_logger,
+        logger=loggers,
         max_steps=args.n_steps,
         accelerator="gpu",
         devices=args.devices,
@@ -605,7 +646,7 @@ def main():
             ckpt_path="last" if args.resume_from_last_checkpoint else None
         )
     finally:
-        if wandb_run is not None:
+        if wandb_logger is not None and wandb is not None and wandb.run is not None:
             wandb.finish()
 
     print("Training complete")
@@ -635,7 +676,7 @@ def parse_args():
     parser.add_argument("--validate_extern", action=argparse.BooleanOptionalAction, default=False, help="Long training with a separate validation process.")
     parser.add_argument("--final_full_cube_inference", action=argparse.BooleanOptionalAction, default=True, help="Run full-cube inference/evaluation when training ends.")
     parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=False, help="Use distributed training.")
-    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Enable Weights & Biases sync.")
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False, help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb_project", type=str, default="banis", help="W&B project name.")
     parser.add_argument("--wandb_entity", type=str, default="", help="W&B entity/team (optional).")
     parser.add_argument(
@@ -648,12 +689,15 @@ def parse_args():
     parser.add_argument(
         "--wandb_sync_tensorboard",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Sync TensorBoard logs to W&B.",
+        default=False,
+        help="Also ask W&B to sync TensorBoard event files. Usually unnecessary when W&B logger is enabled.",
     )
     parser.add_argument("--wandb_run_name", type=str, default="", help="Custom W&B run name (defaults to exp_name).")
     parser.add_argument("--wandb_group", type=str, default="", help="W&B group name (optional).")
     parser.add_argument("--wandb_tags", nargs="*", default=[], help="W&B tags.")
+    parser.add_argument("--wandb_log_model", action=argparse.BooleanOptionalAction, default=False, help="Log checkpoints as W&B artifacts.")
+    parser.add_argument("--wandb_run_id", type=str, default="", help="Existing W&B run id for resume/continuation.")
+    parser.add_argument("--wandb_resume", type=str, default="", choices=["", "allow", "must", "never", "auto"], help="W&B resume policy when --wandb_run_id is set.")
 
     # Data arguments
     parser.add_argument("--base_data_path", type=str, default="/cajal/nvmescratch/projects/NISB/", help="Base path for the dataset.")

@@ -113,6 +113,54 @@ mito:
       train: ["jrc_macrophage-2_recon-1_test0"]
       test: ["jrc_macrophage-2_recon-1_test1"]
       val: ["jrc_macrophage-2_recon-1_test1"]
+    - name: ME2_Beta
+      resolution: [16, 16, 16]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset001_ME2-Beta
+      train: ["me2-beta_train02", "me2-beta_train03", "me2-beta_train04"]
+      test: ["me2-beta_test01", "me2-beta_test02", "me2-beta_test03"]
+      val: ["me2-beta_train01"]
+    - name: ME2_Jurkat
+      resolution: [16, 16, 16]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset002_ME2-Jurkat
+      train: ["me2-jurkat_train01"]
+      test: ["me2-jurkat_test01"]
+      val: ["me2-jurkat_train02"]
+    - name: ME2_Macro
+      resolution: [16, 16, 16]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset003_ME2-Macro
+      train: ["me2-macro_train01"]
+      test: ["me2-macro_test01"]
+      val: ["me2-macro_train02"]
+    - name: ME2_Mossy
+      resolution: [30, 8, 8]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset004_ME2-Mossy
+      train: ["me2-mossy_train01", "me2-mossy_train02"]
+      test: ["me2-mossy_test01", "me2-mossy_test02"]
+      val: ["me2-mossy_train03"]
+    - name: ME2_Podo
+      resolution: [16, 16, 16]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset005_ME2-Podo
+      train: ["me2-podo_train01"]
+      test: ["me2-podo_test01"]
+      val: ["me2-podo_train02"]
+    - name: ME2_Pyra
+      resolution: [30, 8, 8]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset006_ME2-Pyra
+      train: ["me2-pyra_train02", "me2-pyra_train03", "me2-pyra_train04", "me2-pyra_train05", "me2-pyra_train06", "me2-pyra_train07", "me2-pyra_train08", "me2-pyra_train09", "me2-pyra_train10", "me2-pyra_train14", "me2-pyra_train15", "me2-pyra_train16", "me2-pyra_train17"]
+      test: ["me2-pyra_test01"]
+      val: ["me2-pyra_train01", "me2-pyra_train11", "me2-pyra_train12", "me2-pyra_train13"]
+    - name: ME2_Sperm
+      resolution: [16, 16, 16]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset007_ME2-Sperm
+      train: ["me2-sperm_train01"]
+      test: ["me2-sperm_test01"]
+      val: ["me2-sperm_train02"]
+    - name: ME2_Stem
+      resolution: [30, 8, 8]  # nanometers, array order (z, y, x)
+      path: /projects/weilab/liupeng/data/raw/mito/MitoEM2.0/Dataset008_ME2-Stem
+      train: ["me2-stem_train01"]
+      test: ["me2-stem_test01"]
+      val: ["me2-stem_train02"]
     - name: Wei20
       resolution: [30, 8, 8]
       path: /projects/weilab/dataset/mito/mitoEM/chunk/
@@ -124,6 +172,18 @@ mito:
       path: /projects/weilab/dataset/mitoLE/jiang25
       train: ["vol0", "vol1"]
       test: ["vol2"]
+    - name: cereb_normalized
+      resolution: [30, 8, 8]
+      path: /projects/weilab/liupeng/data/processed/cerebellum/banis_ready/cereb_normalized
+      train: []
+      val: []
+      test: []
+    - name: cereb_p7_pc2
+      resolution: [30, 8, 8]
+      path: /projects/weilab/liupeng/data/processed/cerebellum/banis_ready/cereb_p7_pc2
+      train: []
+      val: []
+      test: []
 
 rib:
   data_path: ./rib_data

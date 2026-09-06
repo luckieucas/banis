@@ -290,7 +290,8 @@ def load_sdt_channel(file_path: str, zarr_key: str = "", sdt_channel_idx: int = 
 
 def apply_watershed_segmentation_sdt_only(sdt_channel, skeleton_thr=0.0, min_size=100, 
                                           edt_downsample_factor=1, use_fast_edt=True, 
-                                          edt_parallel=4, edt_anisotropy=None):
+                                          edt_parallel=4, edt_anisotropy=None,
+                                          foreground_thr=0.0):
     """
     Apply two-stage watershed segmentation using only SDT channel.
     """
@@ -315,11 +316,11 @@ def apply_watershed_segmentation_sdt_only(sdt_channel, skeleton_thr=0.0, min_siz
     
     print(f"Initial instance segmentation: {np.max(initial_instance_seg)} regions")
     
-    # Stage 2: Use SDT > 0 as foreground mask (binary mask)
-    print(f"\n=== Stage 2: Create foreground mask from SDT > 0 ===")
+    # Stage 2: Use SDT > foreground_thr as foreground mask (binary mask)
+    print(f"\n=== Stage 2: Create foreground mask from SDT > {foreground_thr} ===")
     
-    foreground_mask = sdt_channel > 0
-    print(f"Foreground mask (SDT > 0) stats: foreground pixels {np.sum(foreground_mask)}, background pixels {np.sum(~foreground_mask)}")
+    foreground_mask = sdt_channel > foreground_thr
+    print(f"Foreground mask (SDT > {foreground_thr}) stats: foreground pixels {np.sum(foreground_mask)}, background pixels {np.sum(~foreground_mask)}")
     
     foreground_mask = foreground_mask.astype(bool)
     foreground_mask = foreground_mask.astype(np.uint8)
@@ -400,12 +401,10 @@ def apply_watershed_segmentation_sdt_only(sdt_channel, skeleton_thr=0.0, min_siz
     
     # Remove small regions
     unique_labels, counts = np.unique(final_instance_seg, return_counts=True)
-    print(f"unique labels: {unique_labels}, counts: {counts}")
-    small_regions_removed = 0
-    for label, count in zip(unique_labels, counts):
-        if count < min_size and label > 0:  # Keep background label 0
-            final_instance_seg[final_instance_seg == label] = 0
-            small_regions_removed += 1
+    remove_labels = unique_labels[(unique_labels > 0) & (counts < min_size)]
+    small_regions_removed = int(remove_labels.size)
+    if small_regions_removed > 0:
+        final_instance_seg[np.isin(final_instance_seg, remove_labels)] = 0
     
     if small_regions_removed > 0:
         print(f"Removed {small_regions_removed} small regions (< {min_size} pixels)")
@@ -470,6 +469,7 @@ def process_watershed_and_eval_sdt_only(
     zarr_key: str = "",
     sdt_channel_idx: int = -1,
     skeleton_threshold: float = 0.0,
+    foreground_threshold: float = 0.0,
     watershed_min_size: int = 100,
     edt_downsample_factor: int = 1,
     use_fast_edt: bool = True,
@@ -540,7 +540,7 @@ def process_watershed_and_eval_sdt_only(
     
     # Apply watershed segmentation using SDT only
     print("\n=== Applying watershed segmentation using SDT channel only ===")
-    print(f"SDT > 0 will be used as binary foreground mask")
+    print(f"SDT > {foreground_threshold} will be used as binary foreground mask")
     print(f"SDT > {skeleton_threshold} will be used for initial instance seeds")
     
     foreground_mask, initial_instance_seg, final_instance_seg = apply_watershed_segmentation_sdt_only(
@@ -550,7 +550,8 @@ def process_watershed_and_eval_sdt_only(
         edt_downsample_factor=edt_downsample_factor,
         use_fast_edt=use_fast_edt,
         edt_parallel=edt_parallel,
-        edt_anisotropy=edt_anisotropy
+        edt_anisotropy=edt_anisotropy,
+        foreground_thr=foreground_threshold,
     )
     
     # Apply mask to segmentation results if mask is provided
@@ -578,7 +579,7 @@ def process_watershed_and_eval_sdt_only(
     save_image_data(final_seg_uint16, str(final_seg_file), reference_sitk_image, h5_key="final_seg")
     
     print(f"\n=== Watershed results saved to: {output_dir} ===")
-    print(f"  - Foreground mask (SDT > 0): {foreground_file.name}")
+    print(f"  - Foreground mask (SDT > {foreground_threshold}): {foreground_file.name}")
     print(f"  - Initial instance seg (SDT > {skeleton_threshold}): {initial_seg_file.name}")
     print(f"  - Final instance seg (refined): {final_seg_file.name}")
     
@@ -802,6 +803,8 @@ Key Differences from watershed_and_eval.py:
     # Watershed segmentation options
     parser.add_argument("--skeleton_threshold", type=float, default=0.0, 
                         help="Threshold for SDT channel to create initial instance seeds (default: 0.0)")
+    parser.add_argument("--foreground_threshold", type=float, default=0.0,
+                        help="Threshold for SDT channel to create the binary foreground mask (default: 0.0)")
     parser.add_argument("--watershed_min_size", type=int, default=200, 
                         help="Minimum size of segmented regions to keep (default: 200)")
     parser.add_argument("--edt_downsample_factor", type=int, default=1, 
@@ -845,6 +848,7 @@ Key Differences from watershed_and_eval.py:
         zarr_key=args.zarr_key,
         sdt_channel_idx=args.sdt_channel_idx,
         skeleton_threshold=args.skeleton_threshold,
+        foreground_threshold=args.foreground_threshold,
         watershed_min_size=args.watershed_min_size,
         edt_downsample_factor=args.edt_downsample_factor,
         use_fast_edt=args.use_fast_edt,

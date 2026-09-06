@@ -36,13 +36,14 @@ except ImportError:
     print("Warning: Evaluation module not available. Install required packages to enable evaluation.")
 
 
-def load_image_data(file_path: str, h5_key: str = ""):
+def load_image_data(file_path: str, h5_key: str = "", zarr_key: str = ""):
     """
     Load image data from h5, nii.gz, or tiff files.
     
     Args:
         file_path: Path to the input file.
         h5_key: Key/path to the data in the h5 file (only used for h5 files).
+        zarr_key: Array key in a Zarr group (only used for Zarr groups).
     
     Returns:
         tuple: (numpy.ndarray, sitk.Image or None) - The loaded image data and SimpleITK image object (for metadata)
@@ -70,6 +71,23 @@ def load_image_data(file_path: str, h5_key: str = ""):
             
             img_data = f[h5_key][:]
     
+    elif file_ext.endswith('.zarr') or os.path.isdir(file_path):
+        print(f"Loading Zarr data from: {file_path}")
+        source = zarr.open(file_path, mode='r')
+        if isinstance(source, zarr.Group):
+            if not zarr_key:
+                available_keys = list(source.array_keys())
+                if len(available_keys) != 1:
+                    raise ValueError(
+                        f"Zarr group contains arrays {available_keys}; provide --zarr_input_key"
+                    )
+                zarr_key = available_keys[0]
+                print(f"No key provided, using only array: {zarr_key}")
+            if zarr_key not in source:
+                raise KeyError(f"Zarr key '{zarr_key}' not found; available arrays: {list(source.array_keys())}")
+            source = source[zarr_key]
+        img_data = np.asarray(source)
+
     elif file_ext.endswith('.nii.gz') or file_ext.endswith('.nii') or file_ext.endswith('.tif') or file_ext.endswith('.tiff'):
         # Read image data using SimpleITK (supports NIfTI, TIFF, and many other medical image formats)
         print(f"Loading image data using SimpleITK from: {file_path}")
@@ -260,11 +278,15 @@ def predict_data(
     input_path: str,
     output_path: str,
     h5_input_key: str = "",
+    zarr_input_key: str = "",
     prediction_channels: int = 3,
     small_size: int = 128,
     divide: int = 255,
     use_batch: bool = True,
     batch_size: int = 4,
+    padding_mode: str = "constant",
+    padding_position: str = "end",
+    padding_constant: float = 0,
     save_channels: str = "all",
     apply_watershed: bool = False,
     binary_threshold: float = 0.5,
@@ -278,14 +300,18 @@ def predict_data(
 
     Args:
         checkpoint_path: Path to the model checkpoint.
-        input_path: Path to the input file (supports .h5, .hdf5, .nii, .nii.gz, .tif, .tiff).
+        input_path: Path to the input file (supports HDF5, Zarr, NIfTI, and TIFF).
         output_path: Path to save the output predictions (format determined by output_format).
         h5_input_key: Key/path to the data in the h5 file (only used for h5 files). If empty, will use the first key (default: "").
+        zarr_input_key: Array key in a Zarr group. Required when the group has multiple arrays.
         prediction_channels: Number of prediction channels (default: 3).
         small_size: Size of patches for inference (default: 128).
         divide: Divisor for the image normalization (default: 255).
         use_batch: Whether to use batched inference for faster processing (default: True).
         batch_size: Number of patches to process in parallel when use_batch=True (default: 4).
+        padding_mode: np.pad mode when input is smaller than patch size (default: constant).
+        padding_position: Where to put padding for short dimensions: end or center (default: end).
+        padding_constant: Constant value for constant padding (default: 0).
         save_channels: Which channels to save: "all", "affinity" (first 3), "skeleton" (last), or comma-separated indices like "0,1,2" (default: "all").
         apply_watershed: Whether to apply watershed segmentation on skeleton channel (default: False).
         binary_threshold: Threshold for affinity channel_0 to create foreground mask (default: 0.5).
@@ -309,7 +335,7 @@ def predict_data(
         pass
     
     # Load image data using the appropriate reader
-    img_data, reference_sitk_image = load_image_data(input_path, h5_input_key)
+    img_data, reference_sitk_image = load_image_data(input_path, h5_input_key, zarr_input_key)
     print(f"Input data shape: {img_data.shape}")
     print(f"Input data dtype: {img_data.dtype}")
     
@@ -342,6 +368,9 @@ def predict_data(
             divide=divide,
             small_size=small_size,
             batch_size=batch_size,
+            padding_mode=padding_mode,
+            padding_position=padding_position,
+            padding_constant=padding_constant,
         )
     else:
         print("Using sequential inference")
@@ -352,6 +381,9 @@ def predict_data(
             prediction_channels=prediction_channels,
             divide=divide,
             small_size=small_size,
+            padding_mode=padding_mode,
+            padding_position=padding_position,
+            padding_constant=padding_constant,
         )
     
     print(f"Prediction shape: {aff_pred.shape}")
@@ -582,6 +614,8 @@ Examples:
     # Model parameters
     parser.add_argument("--h5_input_key", type=str, default="", 
                        help="Key/path to the data in the h5 file (only used for h5 files). If not provided, will use the first key in the file (default: '')")
+    parser.add_argument("--zarr_input_key", type=str, default="",
+                       help="Array key in a Zarr group; required when the group has multiple arrays")
     parser.add_argument("--prediction_channels", type=int, default=7, 
                        help="Number of prediction channels (default: 7)")
     parser.add_argument("--small_size", type=int, default=128, 
@@ -594,10 +628,17 @@ Examples:
                        help="Use batched inference for faster processing (default: True)")
     parser.add_argument("--batch_size", type=int, default=4, 
                        help="Number of patches to process in parallel when using batched inference (default: 4)")
+    parser.add_argument("--padding_mode", type=str, default="constant",
+                       choices=["constant", "edge", "reflect", "symmetric"],
+                       help="np.pad mode used when an input dimension is smaller than small_size (default: constant)")
+    parser.add_argument("--padding_position", type=str, default="end",
+                       choices=["end", "center"],
+                       help="Where to place padding for short dimensions: end or center (default: end)")
+    parser.add_argument("--padding_constant", type=float, default=0,
+                       help="Constant padding value when --padding_mode constant (default: 0)")
     
     # Output options
     parser.add_argument("--save_channels", type=str, default="all", 
-                       choices=["all", "affinity", "skeleton"],
                        help="Which channels to save: 'all', 'affinity' (first 3), 'skeleton' (last), or comma-separated indices (default: all)")
     parser.add_argument("--output_format", type=str, default="auto", 
                        choices=["auto", "zarr", "h5", "nii.gz", "tiff"],
@@ -630,11 +671,15 @@ Examples:
         input_path=args.input_path,
         output_path=args.output_path,
         h5_input_key=args.h5_input_key,
+        zarr_input_key=args.zarr_input_key,
         prediction_channels=args.prediction_channels,
         small_size=args.small_size,
         divide=args.divide,
         use_batch=args.use_batch,
         batch_size=args.batch_size,
+        padding_mode=args.padding_mode,
+        padding_position=args.padding_position,
+        padding_constant=args.padding_constant,
         save_channels=args.save_channels,
         apply_watershed=args.apply_watershed,
         binary_threshold=args.binary_threshold,
@@ -643,4 +688,3 @@ Examples:
         output_format=args.output_format,
         gt_file=args.gt_file,
     )
-

@@ -125,19 +125,75 @@ def load_mask_data(file_path: str, h5_key: str = ""):
     return mask_data
 
 
-def load_prediction_data(file_path: str, zarr_key: str = "", affinity_channel_idx: int = 0, skeleton_channel_idx: int = -1):
+def load_prediction_data(
+    file_path: str = None,
+    zarr_key: str = "",
+    affinity_channel_idx: int = 0,
+    skeleton_channel_idx: int = -1,
+    affinity_file: str = None,
+    skeleton_file: str = None,
+):
     """
     Load prediction data from zarr, h5, nii.gz, or tiff files.
     
     Args:
-        file_path: Path to the input file (zarr, h5, nii.gz, or tiff).
+        file_path: Path to the input file (zarr/h5 or multi-channel nii.gz/tiff).
         zarr_key: Key/path to the data in the zarr file (only used for zarr files). If empty, assumes root array.
         affinity_channel_idx: Index of the affinity channel (default: 0). Can be negative for reverse indexing.
         skeleton_channel_idx: Index of the skeleton channel (default: -1 for last channel). Can be negative for reverse indexing.
+        affinity_file: Optional path to a standalone affinity image file.
+        skeleton_file: Optional path to a standalone skeleton image file.
     
     Returns:
         tuple: (affinity_channel, skeleton_channel, sitk.Image or None) - The loaded channels and SimpleITK image object (for metadata)
     """
+    def _load_scalar_image(image_path: str):
+        """Load a single-channel image from zarr or SimpleITK-supported image."""
+        if image_path.lower().endswith(".zarr") or os.path.isdir(image_path):
+            arr = np.asarray(zarr.open_array(image_path, mode="r"))
+            if arr.ndim not in (2, 3):
+                raise ValueError(
+                    f"Expected 2D/3D scalar zarr for '{image_path}', got shape {arr.shape}."
+                )
+            return arr, None
+
+        image = sitk.ReadImage(image_path)
+        arr = sitk.GetArrayFromImage(image)
+        if arr.ndim not in (2, 3):
+            raise ValueError(
+                f"Expected 2D/3D scalar image for '{image_path}', got shape {arr.shape}. "
+                "Use a scalar affinity/skeleton TIFF (or NIfTI), or provide a multi-channel prediction file."
+            )
+        return arr, image
+
+    if file_path is None and not (affinity_file and skeleton_file):
+        raise ValueError(
+            "Provide --prediction_file, or provide both --affinity_file and --skeleton_file."
+        )
+
+    # Explicit separate-file mode (useful for TIFF outputs saved per-channel)
+    if affinity_file or skeleton_file:
+        aff_path = affinity_file or file_path
+        ske_path = skeleton_file or file_path
+        if aff_path is None or ske_path is None:
+            raise ValueError(
+                "Both affinity and skeleton file paths must be resolvable. "
+                "Provide both --affinity_file and --skeleton_file, or use a valid --prediction_file."
+            )
+
+        print(f"Loading affinity channel from scalar file: {aff_path}")
+        affinity_channel, affinity_sitk = _load_scalar_image(aff_path)
+        print(f"Loading skeleton channel from scalar file: {ske_path}")
+        skeleton_channel, _ = _load_scalar_image(ske_path)
+
+        if affinity_channel.shape != skeleton_channel.shape:
+            raise ValueError(
+                f"Shape mismatch between affinity ({affinity_channel.shape}) and skeleton ({skeleton_channel.shape})"
+            )
+
+        print(f"Loaded separate image channels with shape: {affinity_channel.shape}")
+        return affinity_channel, skeleton_channel, affinity_sitk
+
     file_ext = file_path.lower()
     sitk_image = None
     
@@ -324,17 +380,95 @@ def load_prediction_data(file_path: str, zarr_key: str = "", affinity_channel_id
             raise ValueError(f"Unsupported data shape: {data.shape}. Expected 4D array with channels.")
     
     elif file_ext.endswith('.nii.gz') or file_ext.endswith('.nii') or file_ext.endswith('.tif') or file_ext.endswith('.tiff'):
-        # For image files, we assume they contain a single channel
-        # User should specify separate files for affinity and skeleton
-        raise ValueError("Image files (.nii.gz, .tiff) are not supported for multi-channel predictions. "
-                        "Please use zarr or h5 files, or specify separate files using --affinity_file and --skeleton_file.")
+        # Read image data (supports multi-channel image files or scalar images with explicit separate-file args)
+        print(f"Loading image prediction data from: {file_path}")
+        sitk_image = sitk.ReadImage(file_path)
+        data = sitk.GetArrayFromImage(sitk_image)
+        print(f"Loaded image data shape: {data.shape}, dtype: {data.dtype}")
+
+        if len(data.shape) == 4:
+            # 4D data - determine if channels are first or last (same heuristic as zarr/h5 branch)
+            max_dim = max(data.shape[:-1])
+            if data.shape[0] < max_dim:
+                channels_first = True
+                num_channels = data.shape[0]
+                print(f"Detected channels-first format: (channels={num_channels}, spatial dims)")
+            elif data.shape[-1] < max_dim:
+                channels_first = False
+                num_channels = data.shape[-1]
+                print(f"Detected channels-last format: (spatial dims, channels={num_channels})")
+            else:
+                channels_first = True
+                num_channels = data.shape[0]
+                print(f"Ambiguous format, assuming channels-first: (channels={num_channels}, spatial dims)")
+
+            if affinity_channel_idx < 0:
+                affinity_channel_idx = num_channels + affinity_channel_idx
+            if skeleton_channel_idx < 0:
+                skeleton_channel_idx = num_channels + skeleton_channel_idx
+
+            if not (0 <= affinity_channel_idx < num_channels and 0 <= skeleton_channel_idx < num_channels):
+                raise ValueError(
+                    f"Channel index out of range for {num_channels} channels: "
+                    f"affinity_channel_idx={affinity_channel_idx}, skeleton_channel_idx={skeleton_channel_idx}"
+                )
+
+            if channels_first:
+                affinity_channel = data[affinity_channel_idx]
+                skeleton_channel = data[skeleton_channel_idx]
+            else:
+                affinity_channel = data[..., affinity_channel_idx]
+                skeleton_channel = data[..., skeleton_channel_idx]
+
+            print(f"Extracted affinity channel {affinity_channel_idx}, shape: {affinity_channel.shape}")
+            print(f"Extracted skeleton channel {skeleton_channel_idx}, shape: {skeleton_channel.shape}")
+            return affinity_channel, skeleton_channel, sitk_image
+
+        if len(data.shape) in (2, 3):
+            raise ValueError(
+                "Single-channel image prediction provided. "
+                "For TIFF/NIfTI channel files, pass --affinity_file and --skeleton_file. "
+                "For multi-channel image predictions, provide a 4D image and set channel indices."
+            )
+
+        raise ValueError(
+            f"Unsupported image data shape: {data.shape}. Expected 4D multi-channel image or 2D/3D scalar channel files."
+        )
     
     else:
         raise ValueError(f"Unsupported file format: {file_path}. Supported formats: .zarr, .h5, .hdf5")
 
 
+def _foreground_bbox(mask: np.ndarray):
+    """Return minimal bounding box slices for non-zero foreground mask."""
+    if mask.ndim == 2:
+        y_any = np.any(mask, axis=1)
+        x_any = np.any(mask, axis=0)
+        if not y_any.any() or not x_any.any():
+            return None
+        y_idx = np.where(y_any)[0]
+        x_idx = np.where(x_any)[0]
+        return (slice(y_idx[0], y_idx[-1] + 1), slice(x_idx[0], x_idx[-1] + 1))
+    if mask.ndim == 3:
+        z_any = np.any(mask, axis=(1, 2))
+        y_any = np.any(mask, axis=(0, 2))
+        x_any = np.any(mask, axis=(0, 1))
+        if not z_any.any() or not y_any.any() or not x_any.any():
+            return None
+        z_idx = np.where(z_any)[0]
+        y_idx = np.where(y_any)[0]
+        x_idx = np.where(x_any)[0]
+        return (
+            slice(z_idx[0], z_idx[-1] + 1),
+            slice(y_idx[0], y_idx[-1] + 1),
+            slice(x_idx[0], x_idx[-1] + 1),
+        )
+    return None
+
+
 def apply_watershed_segmentation(affinity_channel, skeleton_data, binary_thr=0.5, skeleton_thr=0.0, min_size=100, 
-                                edt_downsample_factor=1, use_fast_edt=True, edt_parallel=4, edt_anisotropy=None):
+                                edt_downsample_factor=1, use_fast_edt=True, edt_parallel=4, edt_anisotropy=None,
+                                crop_to_foreground=True):
     """
     Apply two-stage watershed segmentation:
     1. Use skeleton distance transform to get initial instance segmentation
@@ -365,25 +499,11 @@ def apply_watershed_segmentation(affinity_channel, skeleton_data, binary_thr=0.5
     skeleton_mask = skeleton_data > skeleton_thr
     print(f"Skeleton mask stats: skeleton pixels {np.sum(skeleton_mask)}")
     
-    # Choose appropriate structure element based on data dimension
-    if len(skeleton_mask.shape) == 3:
-        # 3D data uses ball structure element
-        structure = ball(1)
-    else:
-        # 2D data uses disk structure element
-        structure = disk(1)
+    # Step 1.2: Use skeleton as seeds - label connected components
+    connectivity = 26 if skeleton_mask.ndim == 3 else 8
+    initial_instance_seg = cc3d.connected_components(skeleton_mask, connectivity=connectivity)
     
-    # Step 1.2: Morphological operations to clean skeleton mask
-    # skeleton_mask = ndimage.binary_fill_holes(skeleton_mask)
-    # skeleton_mask = ndimage.binary_opening(skeleton_mask, structure=structure)
-    # print(f"After morphological cleaning: skeleton pixels {np.sum(skeleton_mask)}")
-    
-    # Step 1.3: Use skeleton as seeds - label connected components
-    # skeleton_seeds, num_seeds = ndimage.label(skeleton_mask)
-    # print(f"Found {num_seeds} skeleton seed regions")
-    initial_instance_seg = cc3d.connected_components(skeleton_mask, connectivity=26)
-    
-    if len(np.unique(initial_instance_seg)) == 0:
+    if np.max(initial_instance_seg) == 0:
         print("Warning: No skeleton seeds found! Returning empty segmentation.")
         return (np.zeros_like(skeleton_mask, dtype=np.uint8), 
                 np.zeros_like(skeleton_mask, dtype=np.uint16), 
@@ -400,21 +520,15 @@ def apply_watershed_segmentation(affinity_channel, skeleton_data, binary_thr=0.5
     foreground_mask = affinity_channel > binary_thr
     print(f"Foreground mask stats: foreground pixels {np.sum(foreground_mask)}, background pixels {np.sum(~foreground_mask)}")
     
-    # Step 2.2: Morphological operations to clean foreground mask
-    # foreground_mask = ndimage.binary_fill_holes(foreground_mask)
-    # foreground_mask = ndimage.binary_opening(foreground_mask, structure=structure)
     print(f"After morphological cleaning: foreground pixels {np.sum(foreground_mask)}")
     foreground_mask = foreground_mask.astype(bool)
-    foreground_mask = foreground_mask.astype(np.uint8)
     
     # Step 2.3: Use initial instance segmentation as seeds
-    # Only keep instances that overlap with foreground
-    refined_seeds = initial_instance_seg
-    #refined_seeds[~foreground_mask] = 0  # Remove seeds outside foreground
+    refined_seeds = initial_instance_seg.copy()
+    refined_seeds[~foreground_mask] = 0
     
     # Check how many instances remain
-    unique_seeds = np.unique(refined_seeds)
-    num_refined_seeds = len(unique_seeds) - 1  # Exclude background 0
+    num_refined_seeds = int(np.max(refined_seeds))
     print(f"Refined seeds: {num_refined_seeds} regions (from {np.max(initial_instance_seg)} initial)")
     
     if num_refined_seeds == 0:
@@ -422,7 +536,19 @@ def apply_watershed_segmentation(affinity_channel, skeleton_data, binary_thr=0.5
         final_instance_seg = initial_instance_seg.copy()
         final_instance_seg[~foreground_mask] = 0
     else:
-        # Step 2.4: Compute distance transform on foreground (with optional downsampling)
+        # Step 2.4: Optionally crop computation to foreground bounding box for speed.
+        compute_mask = foreground_mask
+        compute_seeds = refined_seeds
+        compute_slices = None
+        if crop_to_foreground:
+            bbox = _foreground_bbox(foreground_mask)
+            if bbox is not None:
+                compute_slices = bbox
+                compute_mask = foreground_mask[compute_slices]
+                compute_seeds = refined_seeds[compute_slices]
+                print(f"Cropped watershed ROI to shape: {compute_mask.shape}")
+
+        # Step 2.5: Compute distance transform on foreground (with optional downsampling)
         print(f"foreground mask max: {np.max(foreground_mask)}, min: {np.min(foreground_mask)}")
         
         # Determine which EDT method to use
@@ -437,12 +563,12 @@ def apply_watershed_segmentation(affinity_channel, skeleton_data, binary_thr=0.5
         
         if edt_downsample_factor > 1:
             from scipy.ndimage import zoom
-            original_shape = foreground_mask.shape
+            original_shape = compute_mask.shape
             print(f"EDT downsampling: factor={edt_downsample_factor}, original shape={original_shape}")
             
             # Downsample foreground mask using nearest neighbor interpolation
             downsample_zoom = 1.0 / edt_downsample_factor
-            foreground_mask_ds = zoom(foreground_mask.astype(np.float32), downsample_zoom, order=0) > 0.5
+            foreground_mask_ds = zoom(compute_mask.astype(np.float32), downsample_zoom, order=0) > 0.5
             print(f"Downsampled foreground mask shape: {foreground_mask_ds.shape}")
             
             # Compute distance transform on downsampled mask
@@ -473,33 +599,36 @@ def apply_watershed_segmentation(affinity_channel, skeleton_data, binary_thr=0.5
                 # Use fast edt library
                 if edt_anisotropy is None:
                     # Auto-detect anisotropy based on data dimension
-                    edt_anisotropy = tuple([1.0] * len(foreground_mask.shape))
+                    edt_anisotropy = tuple([1.0] * len(compute_mask.shape))
                 distance_fg = edt.edt(
-                    foreground_mask.astype(np.uint8),
+                    compute_mask.astype(np.uint8),
                     anisotropy=edt_anisotropy,
                     black_border=True,
                     parallel=edt_parallel
                 )
             else:
-                distance_fg = ndimage.distance_transform_edt(foreground_mask)
+                distance_fg = ndimage.distance_transform_edt(compute_mask)
         
-        # Step 2.5: Second watershed - use initial instances as seeds on foreground
-        final_instance_seg = watershed(-distance_fg, refined_seeds, mask=foreground_mask)
+        # Step 2.6: Second watershed - use initial instances as seeds on foreground
+        final_roi = watershed(-distance_fg, compute_seeds, mask=compute_mask)
+        if compute_slices is not None:
+            final_instance_seg = np.zeros_like(refined_seeds, dtype=final_roi.dtype)
+            final_instance_seg[compute_slices] = final_roi
+        else:
+            final_instance_seg = final_roi
         print(f"After refinement watershed: {np.max(final_instance_seg)} regions")
     
-    # Step 2.6: Remove small regions
+    # Step 2.7: Remove small regions (vectorized)
     unique_labels, counts = np.unique(final_instance_seg, return_counts=True)
-    print(f"unique labels: {unique_labels}, counts: {counts}")
-    small_regions_removed = 0
-    for label, count in zip(unique_labels, counts):
-        if count < min_size and label > 0:  # Keep background label 0
-            final_instance_seg[final_instance_seg == label] = 0
-            small_regions_removed += 1
+    remove_labels = unique_labels[(unique_labels > 0) & (counts < min_size)]
+    small_regions_removed = int(remove_labels.size)
+    if small_regions_removed > 0:
+        final_instance_seg[np.isin(final_instance_seg, remove_labels)] = 0
     
     if small_regions_removed > 0:
         print(f"Removed {small_regions_removed} small regions (< {min_size} pixels)")
     
-    # Step 2.7: Relabel to have consecutive labels
+    # Step 2.8: Relabel to have consecutive labels
     #final_instance_seg, num_final = ndimage.label(final_instance_seg > 0)
     num_final = np.max(final_instance_seg)
     print(f"Final instance segmentation: {num_final} regions")
@@ -507,7 +636,7 @@ def apply_watershed_segmentation(affinity_channel, skeleton_data, binary_thr=0.5
     return foreground_mask, initial_instance_seg, final_instance_seg
 
 
-def save_image_data(data, output_path, reference_sitk_image=None, h5_key="data"):
+def save_image_data(data, output_path, reference_sitk_image=None, h5_key="data", use_compression=True):
     """
     Save image data to file in the same format as input.
     
@@ -523,7 +652,10 @@ def save_image_data(data, output_path, reference_sitk_image=None, h5_key="data")
         # Save as h5
         print(f"Saving as h5 to: {output_path}")
         with h5py.File(output_path, 'w') as f:
-            f.create_dataset(h5_key, data=data, compression='gzip', compression_opts=6)
+            if use_compression:
+                f.create_dataset(h5_key, data=data, compression='gzip', compression_opts=6)
+            else:
+                f.create_dataset(h5_key, data=data)
     
     elif file_ext.endswith('.nii.gz') or file_ext.endswith('.nii'):
         # Save as NIfTI using SimpleITK
@@ -533,7 +665,7 @@ def save_image_data(data, output_path, reference_sitk_image=None, h5_key="data")
             sitk_output.SetSpacing(reference_sitk_image.GetSpacing())
             sitk_output.SetOrigin(reference_sitk_image.GetOrigin())
             sitk_output.SetDirection(reference_sitk_image.GetDirection())
-        sitk.WriteImage(sitk_output, output_path, useCompression=True)
+        sitk.WriteImage(sitk_output, output_path, useCompression=use_compression)
     
     elif file_ext.endswith('.tif') or file_ext.endswith('.tiff'):
         # Save as TIFF using SimpleITK
@@ -543,7 +675,7 @@ def save_image_data(data, output_path, reference_sitk_image=None, h5_key="data")
             sitk_output.SetSpacing(reference_sitk_image.GetSpacing())
             sitk_output.SetOrigin(reference_sitk_image.GetOrigin())
             sitk_output.SetDirection(reference_sitk_image.GetDirection())
-        sitk.WriteImage(sitk_output, output_path, useCompression=True)
+        sitk.WriteImage(sitk_output, output_path, useCompression=use_compression)
     
     elif file_ext.endswith('.zarr'):
         # Save as zarr
@@ -580,12 +712,17 @@ def process_watershed_and_eval(
     eval_initial: bool = False,
     mask_file: str = None,
     mask_h5_key: str = "",
+    affinity_file: str = None,
+    skeleton_file: str = None,
+    save_intermediate: bool = True,
+    use_compression: bool = True,
+    crop_to_foreground: bool = True,
 ):
     """
     Load prediction data from zarr/h5 file, apply watershed segmentation, and evaluate.
     
     Args:
-        prediction_file: Path to the prediction file (zarr or h5) containing all channels.
+        prediction_file: Path to the prediction file (zarr/h5 or 4D image) containing all channels.
         output_path: Path to output directory.
         zarr_key: Key/path to the data in the zarr/h5 file. If empty, uses first key or root array.
         affinity_channel_idx: Index of the affinity channel (default: 0). Can be negative for reverse indexing.
@@ -602,14 +739,24 @@ def process_watershed_and_eval(
         eval_initial: Whether to also evaluate initial instance segmentation (before affinity refinement). Requires gt_file (default: False).
         mask_file: Path to mask file. If provided, predictions outside mask will be set to 0 for evaluation (default: None).
         mask_h5_key: Key/path to the mask data in the h5 file (only used for h5 files). If empty, uses first key (default: "").
+        affinity_file: Optional path to standalone affinity image file (for separate TIFF/NIfTI channel outputs).
+        skeleton_file: Optional path to standalone skeleton image file (for separate TIFF/NIfTI channel outputs).
+        save_intermediate: If False, only save final instance segmentation.
+        use_compression: If False, disable output compression to reduce write time.
+        crop_to_foreground: If True, run EDT/watershed on foreground ROI only for speed.
     """
     # Load prediction data
-    print(f"Loading prediction data from: {prediction_file}")
+    load_source = prediction_file
+    if affinity_file and skeleton_file:
+        load_source = f"affinity={affinity_file}, skeleton={skeleton_file}"
+    print(f"Loading prediction data from: {load_source}")
     affinity_channel, skeleton_channel, reference_sitk_image = load_prediction_data(
         prediction_file, 
         zarr_key=zarr_key,
         affinity_channel_idx=affinity_channel_idx,
-        skeleton_channel_idx=skeleton_channel_idx
+        skeleton_channel_idx=skeleton_channel_idx,
+        affinity_file=affinity_file,
+        skeleton_file=skeleton_file,
     )
     
     print(f"Affinity channel shape: {affinity_channel.shape}, dtype: {affinity_channel.dtype}")
@@ -620,11 +767,14 @@ def process_watershed_and_eval(
     # Determine output format
     if output_format == "auto":
         # Use the same format as input
-        input_ext = prediction_file.lower()
+        input_source = prediction_file or affinity_file or skeleton_file or ""
+        input_ext = input_source.lower()
         if input_ext.endswith('.h5') or input_ext.endswith('.hdf5'):
             output_ext = '.h5'
-        elif input_ext.endswith('.zarr') or os.path.isdir(prediction_file):
+        elif input_ext.endswith('.zarr') or (prediction_file is not None and os.path.isdir(prediction_file)):
             output_ext = '.zarr'
+        elif input_ext.endswith('.tif') or input_ext.endswith('.tiff'):
+            output_ext = '.tiff'
         else:
             output_ext = '.nii.gz'  # Default
     else:
@@ -673,7 +823,8 @@ def process_watershed_and_eval(
         edt_downsample_factor=edt_downsample_factor,
         use_fast_edt=use_fast_edt,
         edt_parallel=edt_parallel,
-        edt_anisotropy=edt_anisotropy
+        edt_anisotropy=edt_anisotropy,
+        crop_to_foreground=crop_to_foreground,
     )
     
     # Apply mask to segmentation results if mask is provided
@@ -697,25 +848,44 @@ def process_watershed_and_eval(
         
     
     # Save results
-    # Save foreground mask (from affinity channel_0)
-    foreground_file = output_dir / f"foreground_mask{output_ext}"
-    foreground_uint8 = (foreground_mask * 255).astype(np.uint8)
-    save_image_data(foreground_uint8, str(foreground_file), reference_sitk_image, h5_key="foreground_mask")
-    
-    
-    # Save initial instance segmentation (from skeleton watershed)
-    initial_seg_file = output_dir / f"initial_instance_seg{output_ext}"
-    initial_seg_uint16 = initial_instance_seg.astype(np.uint16)
-    save_image_data(initial_seg_uint16, str(initial_seg_file), reference_sitk_image, h5_key="initial_seg")
+    if save_intermediate:
+        foreground_file = output_dir / f"foreground_mask{output_ext}"
+        foreground_uint8 = (foreground_mask * 255).astype(np.uint8)
+        save_image_data(
+            foreground_uint8,
+            str(foreground_file),
+            reference_sitk_image,
+            h5_key="foreground_mask",
+            use_compression=use_compression,
+        )
+
+        initial_seg_file = output_dir / f"initial_instance_seg{output_ext}"
+        initial_seg_uint32 = initial_instance_seg.astype(np.uint32)
+        save_image_data(
+            initial_seg_uint32,
+            str(initial_seg_file),
+            reference_sitk_image,
+            h5_key="initial_seg",
+            use_compression=use_compression,
+        )
+    else:
+        initial_seg_file = output_dir / f"initial_instance_seg{output_ext}"
     
     # Save final instance segmentation (refined with affinity)
     final_seg_file = output_dir / f"final_instance_seg{output_ext}"
-    final_seg_uint16 = final_instance_seg.astype(np.uint16)
-    save_image_data(final_seg_uint16, str(final_seg_file), reference_sitk_image, h5_key="final_seg")
+    final_seg_uint32 = final_instance_seg.astype(np.uint32)
+    save_image_data(
+        final_seg_uint32,
+        str(final_seg_file),
+        reference_sitk_image,
+        h5_key="final_seg",
+        use_compression=use_compression,
+    )
     
     print(f"\n=== Watershed results saved to: {output_dir} ===")
-    print(f"  - Foreground mask: {foreground_file.name}")
-    print(f"  - Initial instance seg (from skeleton): {initial_seg_file.name}")
+    if save_intermediate:
+        print(f"  - Foreground mask: {foreground_file.name}")
+        print(f"  - Initial instance seg (from skeleton): {initial_seg_file.name}")
     print(f"  - Final instance seg (refined): {final_seg_file.name}")
     
     # Evaluate final instance segmentation if ground truth is provided
@@ -884,7 +1054,7 @@ def process_watershed_and_eval(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Apply watershed segmentation on prediction data (zarr/h5) and evaluate",
+        description="Apply watershed segmentation on prediction data (zarr/h5/tiff/nii) and evaluate",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -926,12 +1096,27 @@ Examples:
   # Save in specific format
   python watershed_and_eval.py --prediction_file predictions.zarr --output_path output_dir/ \\
       --output_format nii.gz
+
+  # Use separate affinity/skeleton TIFF files
+  python watershed_and_eval.py --affinity_file affinity_0.tiff --skeleton_file skeleton.tiff --output_path output_dir/
+
+  # Use a multi-channel TIFF and select channels
+  python watershed_and_eval.py --prediction_file prediction_multichannel.tiff --output_path output_dir/ \\
+      --affinity_channel_idx 0 --skeleton_channel_idx -1
+
+  # Faster writes and less I/O (save final output only, disable compression)
+  python watershed_and_eval.py --affinity_file affinity_0.tiff --skeleton_file skeleton.tiff --output_path output_dir/ \\
+      --save_final_only --no_compression --edt_downsample_factor 2 --edt_parallel 16
         """
     )
     
     # Required arguments
-    parser.add_argument("--prediction_file", type=str, required=True, 
-                       help="Path to the prediction file (zarr or h5) containing all channels")
+    parser.add_argument("--prediction_file", type=str, required=False, 
+                       help="Path to prediction file containing all channels (.zarr/.h5 or 4D .tiff/.nii)")
+    parser.add_argument("--affinity_file", type=str, default=None,
+                       help="Path to standalone affinity image file (e.g., affinity_0.tiff).")
+    parser.add_argument("--skeleton_file", type=str, default=None,
+                       help="Path to standalone skeleton image file (e.g., skeleton.tiff).")
     parser.add_argument("--output_path", type=str, required=True, 
                        help="Path to output directory")
     
@@ -966,6 +1151,18 @@ Examples:
     parser.add_argument("--output_format", type=str, default="auto", 
                        choices=["auto", "zarr", "h5", "nii.gz", "tiff"],
                        help="Output format: 'auto' (same as input), 'zarr', 'h5', 'nii.gz', 'tiff' (default: auto)")
+    parser.add_argument("--save_intermediate", action="store_true", default=True,
+                       help="Save foreground and initial-instance outputs in addition to final segmentation (default: True)")
+    parser.add_argument("--save_final_only", action="store_false", dest="save_intermediate",
+                       help="Only save final_instance_seg output to reduce I/O time")
+    parser.add_argument("--use_compression", action="store_true", default=True,
+                       help="Use compression when writing outputs (default: True)")
+    parser.add_argument("--no_compression", action="store_false", dest="use_compression",
+                       help="Disable compression for faster output writes")
+    parser.add_argument("--crop_to_foreground", action="store_true", default=True,
+                       help="Crop EDT/watershed computation to foreground ROI for speed (default: True)")
+    parser.add_argument("--no_crop_to_foreground", action="store_false", dest="crop_to_foreground",
+                       help="Disable foreground ROI cropping")
     
     # Evaluation options
     parser.add_argument("--gt_file", type=str, default=None, 
@@ -980,8 +1177,17 @@ Examples:
     args = parser.parse_args()
     
     # Validate paths
-    if not os.path.exists(args.prediction_file):
+    if not args.prediction_file and not (args.affinity_file and args.skeleton_file):
+        parser.error("Please provide --prediction_file, or provide both --affinity_file and --skeleton_file.")
+
+    if args.prediction_file and not os.path.exists(args.prediction_file):
         raise FileNotFoundError(f"Prediction file not found: {args.prediction_file}")
+
+    if args.affinity_file and not os.path.exists(args.affinity_file):
+        raise FileNotFoundError(f"Affinity file not found: {args.affinity_file}")
+
+    if args.skeleton_file and not os.path.exists(args.skeleton_file):
+        raise FileNotFoundError(f"Skeleton file not found: {args.skeleton_file}")
     
     # Convert edt_anisotropy list to tuple if provided
     edt_anisotropy = tuple(args.edt_anisotropy) if args.edt_anisotropy is not None else None
@@ -1004,4 +1210,9 @@ Examples:
         eval_initial=args.eval_initial,
         mask_file=args.mask_file,
         mask_h5_key=args.mask_h5_key,
+        affinity_file=args.affinity_file,
+        skeleton_file=args.skeleton_file,
+        save_intermediate=args.save_intermediate,
+        use_compression=args.use_compression,
+        crop_to_foreground=args.crop_to_foreground,
     )
